@@ -49,6 +49,7 @@ export AUR_PACKAGES="\
 "
 
 export SERVICES="\
+	bluetooth \
 	fstrim.timer \
 	inputplumber \
 	lightdm \
