@@ -7,8 +7,10 @@ use gilrs::{Gilrs, Button, Axis};
 use std::panic;
 use futures;
 use std::sync::atomic::{AtomicU16, Ordering};
+use bluetooth::{BluetoothManager, BluetoothState, ControllerStatus};
 
 mod save;
+mod bluetooth;
 
 const SCREEN_WIDTH: i32 = 640;
 const SCREEN_HEIGHT: i32 = 360;
@@ -123,7 +125,7 @@ struct DrawContext {
 enum Screen {
     MainMenu,
     SaveData,
-    Controllers,
+    BluetoothControllers,
     Audio,
 }
 
@@ -145,6 +147,7 @@ struct AnimationState {
     dialog_transition_progress: f32, // Progress of dialog transition (0.0 to 1.0)
     dialog_transition_start_pos: Vec2, // Starting position for icon transition
     dialog_transition_end_pos: Vec2, // Ending position for icon transition
+    dots_animation_time: f32, // Time counter for dots animation
 }
 
 impl AnimationState {
@@ -153,6 +156,7 @@ impl AnimationState {
     const CURSOR_ANIMATION_SPEED: f32 = 10.0; // Speed of cursor color animation
     const CURSOR_TRANSITION_DURATION: f32 = 0.15; // Duration of cursor transition animation
     const DIALOG_TRANSITION_DURATION: f32 = 0.4; // Duration of dialog transition animation
+    const DOTS_ANIMATION_SPEED: f32 = 2.0; // Speed of dots animation (dots per second)
 
     fn new() -> Self {
         AnimationState {
@@ -165,6 +169,7 @@ impl AnimationState {
             dialog_transition_progress: 0.0,
             dialog_transition_start_pos: Vec2::ZERO,
             dialog_transition_end_pos: Vec2::ZERO,
+            dots_animation_time: 0.0,
         }
     }
 
@@ -198,6 +203,8 @@ impl AnimationState {
         if self.cursor_transition_time > 0.0 {
             self.cursor_transition_time = (self.cursor_transition_time - delta_time).max(0.0);
         }
+        // Update dots animation
+        self.dots_animation_time = (self.dots_animation_time + delta_time * Self::DOTS_ANIMATION_SPEED) % 4.0; // 4 seconds cycle (0-3 dots)
     }
 
     fn trigger_shake(&mut self, is_left: bool) {
@@ -250,6 +257,11 @@ impl AnimationState {
         // Use smooth easing function
         let t = t * t * (3.0 - 2.0 * t);
         self.dialog_transition_start_pos.lerp(self.dialog_transition_end_pos, t)
+    }
+
+    fn get_scanning_dots(&self) -> String {
+        let dot_count = (self.dots_animation_time.floor() as usize) % 4; // 0, 1, 2, or 3 dots
+        ".".repeat(dot_count)
     }
 }
 
@@ -935,6 +947,90 @@ fn render_dialog(
     }
 }
 
+fn render_bluetooth_dialog(
+    ctx: &DrawContext,
+    dialog: &Dialog,
+    animation_state: &AnimationState,
+) {
+    // Only show dialog background and content when animation is complete
+    if animation_state.dialog_transition_progress >= 1.0 {
+        draw_rectangle(0.0, 0.0, SCREEN_WIDTH as f32, SCREEN_HEIGHT as f32, UI_BG_COLOR_DIALOG);
+    }
+
+    // Draw dialog description
+    if animation_state.dialog_transition_progress >= 1.0 {
+        if let Some(desc) = dialog.desc.clone() {
+            text(&ctx, &desc, (FONT_SIZE*5) as f32, (FONT_SIZE*5) as f32);
+        }
+    }
+
+    // Find the longest option text for centering
+    let longest_option = dialog.options.iter()
+        .map(|opt| opt.text.len())
+        .max()
+        .unwrap_or(0);
+
+    // Calculate the width of the longest option in pixels
+    let longest_width = measure_text(&dialog.options.iter()
+        .find(|opt| opt.text.len() == longest_option)
+        .map(|opt| opt.text.to_uppercase())
+        .unwrap_or_default(),
+        Some(&ctx.font),
+        FONT_SIZE,
+        1.0).width;
+
+    // Calculate the starting X position to center all options
+    let options_start_x = (SCREEN_WIDTH as f32 - longest_width) / 2.0;
+
+    // Only render options when animation is complete
+    if animation_state.dialog_transition_progress >= 1.0 {
+        // Add padding to the selection rectangle
+        const SELECTION_PADDING_X: f32 = 16.0;  // Padding on each side
+        const SELECTION_PADDING_Y: f32 = 4.0;   // Padding on top and bottom
+
+        for (i, option) in dialog.options.iter().enumerate() {
+            let y_pos = (FONT_SIZE*7 + FONT_SIZE*2*(i as u16)) as f32;
+            let shake_offset = if option.disabled {
+                animation_state.calculate_shake_offset(animation_state.shake_dialog)
+            } else {
+                0.0
+            };
+            if option.disabled {
+                text_disabled(&ctx, &option.text, options_start_x + shake_offset, y_pos);
+            } else {
+                text(&ctx, &option.text, options_start_x, y_pos);
+            }
+        }
+
+        // Draw selection rectangle with padding
+        let selection_y = (FONT_SIZE*6 + FONT_SIZE*2*(dialog.selection as u16)) as f32;
+        let selected_option = &dialog.options[dialog.selection];
+        let selection_shake = if selected_option.disabled {
+            animation_state.calculate_shake_offset(animation_state.shake_dialog)
+        } else {
+            0.0
+        };
+
+        let cursor_color = animation_state.get_cursor_color();
+        let cursor_scale = animation_state.get_cursor_scale();
+        let base_width = longest_width + (SELECTION_PADDING_X * 2.0);
+        let base_height = 1.2*FONT_SIZE as f32 + (SELECTION_PADDING_Y * 2.0);
+        let scaled_width = base_width * cursor_scale;
+        let scaled_height = base_height * cursor_scale;
+        let offset_x = (scaled_width - base_width) / 2.0;
+        let offset_y = (scaled_height - base_height) / 2.0;
+
+        draw_rectangle_lines(
+            options_start_x - SELECTION_PADDING_X + selection_shake - offset_x,
+            selection_y - SELECTION_PADDING_Y - offset_y,
+            scaled_width,
+            scaled_height,
+            4.0,
+            cursor_color
+        );
+    }
+}
+
 fn create_confirm_delete_dialog() -> Dialog {
     Dialog {
         id: "confirm_delete".to_string(),
@@ -1051,6 +1147,42 @@ fn create_error_dialog(message: String) -> Dialog {
     }
 }
 
+fn create_bluetooth_controller_dialog(controller: &bluetooth::BluetoothController) -> Dialog {
+    let mut options = Vec::new();
+    
+    // Add disconnect option only if connected
+    if controller.status == bluetooth::ControllerStatus::Connected {
+        options.push(DialogOption {
+            text: "DISCONNECT".to_string(),
+            value: "DISCONNECT".to_string(),
+            disabled: false,
+        });
+    }
+    
+    // Add forget option
+    options.push(DialogOption {
+        text: "FORGET".to_string(),
+        value: "FORGET".to_string(),
+        disabled: false,
+    });
+    
+    // Add cancel option
+    options.push(DialogOption {
+        text: "CANCEL".to_string(),
+        value: "CANCEL".to_string(),
+        disabled: false,
+    });
+
+    Dialog {
+        id: "bluetooth_controller".to_string(),
+        desc: Some(controller.name.clone()),
+        options,
+        selection: 0,
+    }
+}
+
+
+
 #[derive(Clone, Debug, PartialEq)]
 enum DialogState {
     None,
@@ -1064,7 +1196,7 @@ fn render_main_menu(
     selected_option: usize,
     animation_state: &AnimationState,
 ) {
-    const MENU_OPTIONS: [&str; 3] = ["SAVE DATA", "CONTROLLERS", "AUDIO"];
+    const MENU_OPTIONS: [&str; 3] = ["SAVE DATA", "BLUETOOTH CONTROLLERS", "AUDIO"];
     const MENU_START_Y: f32 = 120.0;
     const MENU_OPTION_HEIGHT: f32 = 40.0;
     const MENU_PADDING: f32 = 16.0;
@@ -1097,16 +1229,85 @@ fn render_main_menu(
     }
 }
 
-fn render_controllers_screen(ctx: &DrawContext) {
-    // Draw title
-    text(&ctx, "CONTROLLERS", (SCREEN_WIDTH as f32 - measure_text("CONTROLLERS", Some(&ctx.font), FONT_SIZE * 2, 1.0).width) / 2.0, 60.0);
 
-    // Draw placeholder text
-    text(&ctx, "CONTROLLER SETTINGS", (SCREEN_WIDTH as f32 - measure_text("CONTROLLER SETTINGS", Some(&ctx.font), FONT_SIZE, 1.0).width) / 2.0, 150.0);
-    text(&ctx, "COMING SOON", (SCREEN_WIDTH as f32 - measure_text("COMING SOON", Some(&ctx.font), FONT_SIZE, 1.0).width) / 2.0, 180.0);
+fn render_bluetooth_controllers_screen(
+    ctx: &DrawContext,
+    bluetooth_state: &BluetoothState,
+    selected_controller: usize,
+    animation_state: &AnimationState,
+) {
+    // Draw background
+    draw_rectangle(0.0, 0.0, SCREEN_WIDTH as f32, SCREEN_HEIGHT as f32, UI_BG_COLOR);
+
+    // Draw scanning status
+    if !bluetooth_state.adapter_powered {
+        text(&ctx, "BLUETOOTH ADAPTER NOT AVAILABLE", 20.0, 40.0);
+    } else {
+        let dots = animation_state.get_scanning_dots();
+        let scanning_text = format!("SCANNING FOR BLUETOOTH CONTROLLERS{}", dots);
+        text(&ctx, &scanning_text, 20.0, 40.0);
+    }
+
+    // Draw controller list
+    const LIST_START_Y: f32 = 90.0;
+    const LIST_ITEM_HEIGHT: f32 = 30.0;
+    const LIST_PADDING: f32 = 10.0;
+
+    for (i, controller) in bluetooth_state.controllers.iter().enumerate() {
+        let y_pos = LIST_START_Y + (i as f32 * LIST_ITEM_HEIGHT);
+        
+        // Draw selection highlight
+        if i == selected_controller {
+            let cursor_color = animation_state.get_cursor_color();
+            let cursor_scale = animation_state.get_cursor_scale();
+            let base_width = SCREEN_WIDTH as f32 - 32.0;
+            let base_height = LIST_ITEM_HEIGHT;
+            let scaled_width = base_width * cursor_scale;
+            let scaled_height = base_height * cursor_scale;
+            let offset_x = (scaled_width - base_width) / 2.0;
+            let offset_y = (scaled_height - base_height) / 2.0;
+            let x_pos = 16.0;
+            draw_rectangle_lines(x_pos - offset_x, y_pos - 2.0 - offset_y - 10.0, scaled_width, scaled_height, 4.0, cursor_color);
+        }
+
+        // Draw controller name
+        let name_text = &controller.name;
+        text(&ctx, name_text, 20.0, y_pos + LIST_PADDING);
+
+        // Draw status
+        let status_text = match controller.status {
+            ControllerStatus::Connecting => "CONNECTING",
+            ControllerStatus::Connected => "CONNECTED",
+            ControllerStatus::Disconnected => "DISCONNECTED",
+        };
+        
+        let status_color = match controller.status {
+            ControllerStatus::Connecting => Color { r: 1.0, g: 1.0, b: 0.0, a: 1.0 }, // Yellow
+            ControllerStatus::Connected => Color { r: 0.0, g: 1.0, b: 0.0, a: 1.0 },   // Green
+            ControllerStatus::Disconnected => Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }, // Red
+        };
+        
+        let status_x = SCREEN_WIDTH as f32 - measure_text(status_text, Some(&ctx.font), FONT_SIZE, 1.0).width - 20.0;
+        draw_text_ex(&status_text.to_uppercase(), status_x + 1.0, y_pos + LIST_PADDING + 1.0, TextParams {
+            font: Some(&ctx.font),
+            font_size: FONT_SIZE,
+            color: Color {r:0.0, g:0.0, b:0.0, a:0.9},
+            ..Default::default()
+        });
+        draw_text_ex(&status_text.to_uppercase(), status_x, y_pos + LIST_PADDING, TextParams {
+            font: Some(&ctx.font),
+            font_size: FONT_SIZE,
+            color: status_color,
+            ..Default::default()
+        });
+    }
+
 }
 
 fn render_audio_screen(ctx: &DrawContext) {
+    // Draw background
+    draw_rectangle(0.0, 0.0, SCREEN_WIDTH as f32, SCREEN_HEIGHT as f32, UI_BG_COLOR);
+
     // Draw title
     text(&ctx, "AUDIO", (SCREEN_WIDTH as f32 - measure_text("AUDIO", Some(&ctx.font), FONT_SIZE * 2, 1.0).width) / 2.0, 60.0);
 
@@ -1142,6 +1343,7 @@ async fn main() {
     // Screen state
     let mut current_screen = Screen::MainMenu;
     let mut main_menu_selection = 0;
+    let mut bluetooth_controller_selection = 0;
 
     // Create thread-safe storage media state
     let storage_state = Arc::new(Mutex::new(StorageMediaState::new()));
@@ -1160,6 +1362,20 @@ async fn main() {
                 state.update_media();
             }
         }
+    });
+
+    // Create thread-safe bluetooth state
+    let bluetooth_state = Arc::new(Mutex::new(BluetoothState::new()));
+    let bluetooth_manager = Arc::new(Mutex::new(None::<BluetoothManager>));
+
+    // Spawn background thread for bluetooth management
+    let thread_bluetooth_manager = bluetooth_manager.clone();
+    let thread_bluetooth_state = bluetooth_state.clone();
+    thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            bluetooth::bluetooth_background_task(thread_bluetooth_manager, thread_bluetooth_state).await;
+        });
     });
 
     let mut memories = Vec::new();
@@ -1258,7 +1474,7 @@ async fn main() {
                     animation_state.trigger_transition();
                     sound_effects.play_cursor_move();
                 }
-                if input_state.down && main_menu_selection < 2 {
+                if input_state.down && main_menu_selection < 3 {
                     main_menu_selection += 1;
                     animation_state.trigger_transition();
                     sound_effects.play_cursor_move();
@@ -1271,7 +1487,19 @@ async fn main() {
                             sound_effects.play_select();
                         },
                         1 => {
-                            current_screen = Screen::Controllers;
+                            current_screen = Screen::BluetoothControllers;
+                            // Start scanning for bluetooth controllers
+                            let manager_clone = bluetooth_manager.clone();
+                            thread::spawn(move || {
+                                let rt = tokio::runtime::Runtime::new().unwrap();
+                                rt.block_on(async {
+                                    if let Some(manager) = &mut *manager_clone.lock().unwrap() {
+                                        if let Err(_) = manager.start_scanning().await {
+                                            // Error starting scan, continue
+                                        }
+                                    }
+                                });
+                            });
                             sound_effects.play_select();
                         },
                         2 => {
@@ -1484,7 +1712,7 @@ async fn main() {
                     DialogState::Open => {
                         // When dialog is fully open, only render the dialog
                         if let Some(dialog) = dialogs.last_mut() {
-                            render_dialog(&ctx, dialog, &memories, selected_memory, &icon_cache, &copy_op_state, &placeholder, scroll_offset, &animation_state);
+                            render_bluetooth_dialog(&ctx, dialog, &animation_state);
 
                             let mut selection: i32 = dialog.selection as i32 + dialog.options.len() as i32;
                             if input_state.up {
@@ -1563,13 +1791,125 @@ async fn main() {
                     }
                 }
             },
-            Screen::Controllers => {
-                render_controllers_screen(&ctx);
+            Screen::BluetoothControllers => {
+                match dialog_state {
+                    DialogState::None => {
+                        if let Ok(state) = bluetooth_state.lock() {
+                            render_bluetooth_controllers_screen(&ctx, &state, bluetooth_controller_selection, &animation_state);
+                        }
 
-                // Handle back navigation
-                if input_state.back {
-                    current_screen = Screen::MainMenu;
-                    sound_effects.play_back();
+                        // Handle back navigation
+                        if input_state.back {
+                            // Stop scanning when leaving the screen
+                            let manager_clone = bluetooth_manager.clone();
+                            thread::spawn(move || {
+                                let rt = tokio::runtime::Runtime::new().unwrap();
+                                rt.block_on(async {
+                                    if let Some(manager) = &mut *manager_clone.lock().unwrap() {
+                                        if let Err(_) = manager.stop_scanning().await {
+                                            // Error stopping scan, continue
+                                        }
+                                    }
+                                });
+                            });
+                            current_screen = Screen::MainMenu;
+                            sound_effects.play_back();
+                        }
+
+                        // Handle controller selection navigation
+                        if let Ok(state) = bluetooth_state.lock() {
+                            let controller_count = state.controllers.len();
+                            
+                            if input_state.up && bluetooth_controller_selection > 0 {
+                                bluetooth_controller_selection -= 1;
+                                animation_state.trigger_transition();
+                                sound_effects.play_cursor_move();
+                            }
+                            
+                            if input_state.down && bluetooth_controller_selection < controller_count.saturating_sub(1) {
+                                bluetooth_controller_selection += 1;
+                                animation_state.trigger_transition();
+                                sound_effects.play_cursor_move();
+                            }
+                            
+                            // Handle controller selection for submenu
+                            if input_state.select && controller_count > 0 {
+                                if let Some(controller) = state.get_controller(bluetooth_controller_selection) {
+                                    dialogs.push(create_bluetooth_controller_dialog(controller));
+                                    dialog_state = DialogState::Opening;
+                                    // Trigger dialog transition animation (no icon transition needed for bluetooth)
+                                    animation_state.trigger_dialog_transition(Vec2::ZERO, Vec2::ZERO);
+                                    sound_effects.play_select();
+                                }
+                            }
+                        }
+                    },
+                    DialogState::Opening => {
+                        // During opening, render the main view
+                        if let Ok(state) = bluetooth_state.lock() {
+                            render_bluetooth_controllers_screen(&ctx, &state, bluetooth_controller_selection, &animation_state);
+                        }
+                    },
+                    DialogState::Open => {
+                        // When dialog is fully open, only render the dialog
+                        if let Some(dialog) = dialogs.last_mut() {
+                            render_dialog(&ctx, dialog, &memories, selected_memory, &icon_cache, &copy_op_state, &placeholder, scroll_offset, &animation_state);
+
+                            let mut selection: i32 = dialog.selection as i32 + dialog.options.len() as i32;
+                            if input_state.up {
+                                selection -= 1;
+                                animation_state.trigger_transition();
+                                sound_effects.play_cursor_move();
+                            }
+
+                            if input_state.down {
+                                selection += 1;
+                                animation_state.trigger_transition();
+                                sound_effects.play_cursor_move();
+                            }
+
+                            let mut cancel = false;
+                            if input_state.back {
+                                cancel = true;
+                            }
+
+                            let next_selection = selection as usize % dialog.options.len();
+                            if next_selection != dialog.selection {
+                                // Store the new selection to apply after we're done with the immutable borrow
+                                let new_selection = next_selection;
+                                dialog.selection = new_selection;
+                            } else {
+                                // We need to handle the select input
+                                if input_state.select {
+                                    let selected_option = &dialog.options[dialog.selection];
+                                    if !selected_option.disabled {
+                                        action_dialog_id = dialog.id.clone();
+                                        action_option_value = selected_option.value.clone();
+
+                                        if selected_option.value == "CANCEL" || selected_option.value == "OK" {
+                                            cancel = true;
+                                        } else {
+                                            sound_effects.play_select();
+                                        }
+                                    } else {
+                                        animation_state.trigger_dialog_shake();
+                                        sound_effects.play_reject();
+                                    }
+                                }
+                            }
+
+                            if cancel {
+                                dialog_state = DialogState::Closing;
+                                sound_effects.play_back();
+                            }
+                        }
+                    },
+                    DialogState::Closing => {
+                        // During closing, render the main view
+                        if let Ok(state) = bluetooth_state.lock() {
+                            render_bluetooth_controllers_screen(&ctx, &state, bluetooth_controller_selection, &animation_state);
+                        }
+                    }
                 }
             },
             Screen::Audio => {
@@ -1654,6 +1994,55 @@ async fn main() {
                 dialog_state = DialogState::Closing;
                 sound_effects.play_back();
             },
+            ("bluetooth_controller", "DISCONNECT") => {
+                if let Ok(state) = bluetooth_state.lock() {
+                    if let Some(controller) = state.get_controller(bluetooth_controller_selection) {
+                        let address = controller.address.clone();
+                        let manager_clone = bluetooth_manager.clone();
+                        
+                        thread::spawn(move || {
+                            let rt = tokio::runtime::Runtime::new().unwrap();
+                            rt.block_on(async {
+                                if let Some(manager) = &*manager_clone.lock().unwrap() {
+                                    if let Err(_) = manager.disconnect_device(&address).await {
+                                        // Error disconnecting device, continue
+                                    }
+                                }
+                            });
+                        });
+                        
+                        dialog_state = DialogState::Closing;
+                        sound_effects.play_select();
+                    }
+                }
+            },
+            ("bluetooth_controller", "FORGET") => {
+                if let Ok(state) = bluetooth_state.lock() {
+                    if let Some(controller) = state.get_controller(bluetooth_controller_selection) {
+                        let address = controller.address.clone();
+                        let manager_clone = bluetooth_manager.clone();
+                        
+                        thread::spawn(move || {
+                            let rt = tokio::runtime::Runtime::new().unwrap();
+                            rt.block_on(async {
+                                if let Some(manager) = &*manager_clone.lock().unwrap() {
+                                    if let Err(_) = manager.remove_device(&address).await {
+                                        // Error removing device, continue
+                                    }
+                                }
+                            });
+                        });
+                        
+                        dialog_state = DialogState::Closing;
+                        sound_effects.play_select();
+                    }
+                }
+            },
+            ("bluetooth_controller", "CANCEL") => {
+                dialog_state = DialogState::Closing;
+                sound_effects.play_back();
+            },
+
             _ => {}
         }
 
