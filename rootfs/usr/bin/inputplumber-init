@@ -1,0 +1,29 @@
+#! /bin/bash
+
+# this is still not working reliably with bluetooth controllers
+# with bluetooth controllers, inputplumber needs to be manually restarted and manage-all turned on after boot
+
+
+for i in $(seq 1 30); do
+	if systemctl status bluetooth | grep -q 'Status: "Running"'; then
+		break
+	fi
+
+	sleep 0.1
+done
+
+
+
+#sleep 1
+systemctl restart inputplumber
+
+
+for i in $(seq 1 30); do
+	inputplumber devices manage-all --enable
+
+	if [ "$?" == "0" ]; then
+		break
+	fi
+
+	sleep 0.1
+done
